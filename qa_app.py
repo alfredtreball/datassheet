@@ -1,163 +1,199 @@
 import os
-import PyPDF2
-import random
-import itertools
 import streamlit as st
-from io import StringIO
-from langchain.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain.chat_models import ChatOpenAI
-from langchain.retrievers import SVMRetriever
-from langchain.chains import QAGenerationChain
-from langchain.embeddings.openai import OpenAIEmbeddings
+from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from langchain.callbacks.base import CallbackManager
 from langchain.embeddings import HuggingFaceEmbeddings
-from dotenv import load_dotenv
-from tenacity import retry, wait_random_exponential, stop_after_attempt
+from langchain.vectorstores import FAISS
+from langchain.schema import Document
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 
-st.set_page_config(page_title="PDF Analyzer", page_icon=':shark:')
+# Configuración de Streamlit
+st.set_page_config(page_title="LSDatasheet by Alfred - Pau", page_icon=":robot:", layout="wide")
+st.title("LSDatasheet by Alfred - Pau")
 
-# Cargar variables de entorno desde .env
-load_dotenv()
+# Aplicar estilo CSS para el fondo y la separación
+st.markdown(
+    """
+    <style>
+    body {
+        background-color: #f0f0f0;
+    }
+    .separator {
+        border-top: 2px solid #bbb;
+        margin-top: 20px;
+        margin-bottom: 20px;
+    }
+    .user-msg {
+        background-color: #d4f4dd;
+        color: black;
+        padding: 10px;
+        border-radius: 10px;
+        margin-bottom: 10px;
+        text-align: left;
+    }
+    .bot-msg {
+        background-color: #e1e1e1;
+        color: black;
+        padding: 10px;
+        border-radius: 10px;
+        margin-bottom: 10px;
+        text-align: right;
+        white-space: pre-wrap;  /* Mantiene los saltos de línea y los espacios */
+    }
+    .bot-ref {
+        background-color: #e1e1e1;
+        color: black;
+        padding: 10px;
+        border-radius: 10px;
+        margin-bottom: 10px;
+        text-align: right;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-@st.cache_data
-def load_docs(files):
-    st.info("Reading doc ...")
-    all_text = ""
-    for file_path in files:
-        file_extension = os.path.splitext(file_path.name)[1]
-        if file_extension == ".pdf":
-            pdf_reader = PyPDF2.PdfReader(file_path)
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text()
-            all_text += text
-        elif file_extension == ".txt":
-            stringio = StringIO(file_path.getvalue().decode("utf-8"))
-            text = stringio.read()
-            all_text += text
-        else:
-            st.warning('Please provide txt or pdf.', icon="⚠️")
-    return all_text
+# Inicializar el historial de conversación
+if 'history' not in st.session_state:
+    st.session_state['history'] = []
 
-@st.cache_resource
-@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(10))
-def create_retriever(_embeddings, splits, retriever_type):
-    if retriever_type == "SIMILARITY SEARCH":
-        try:
-            vectorstore = FAISS.from_texts(splits, _embeddings)
-        except (IndexError, ValueError) as e:
-            st.error(f"Error creating vectorstore: {e}")
-            return
-        retriever = vectorstore.as_retriever(k=5)
-    elif retriever_type == "SUPPORT VECTOR MACHINES":
-        retriever = SVMRetriever.from_texts(splits, _embeddings)
-    return retriever
+if 'summary' not in st.session_state:
+    st.session_state['summary'] = None
 
-@st.cache_resource
-def split_texts(text, chunk_size, overlap):
-    st.info("Splitting doc ...")
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size, chunk_overlap=overlap)
-    splits = text_splitter.split_text(text)
-    if not splits:
-        st.error("Failed to split document")
-        st.stop()
-    return splits
+def split_text_into_chunks(text, chunk_size=512):
+    """Divide el texto en fragmentos más pequeños"""
+    text_chunks = []
+    while len(text) > chunk_size:
+        idx = text[:chunk_size].rfind('.')
+        if idx == -1:
+            idx = chunk_size
+        text_chunks.append(text[:idx])
+        text = text[idx:]
+    if text:
+        text_chunks.append(text)
+    return text_chunks
 
-@st.cache_data
-@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(10))
-def generate_eval(text, N, chunk):
-    st.info("Generating sample questions ...")
-    n = len(text)
-    starting_indices = [random.randint(0, n-chunk) for _ in range(N)]
-    sub_sequences = [text[i:i+chunk] for i in starting_indices]
-    chain = QAGenerationChain.from_llm(ChatOpenAI(api_key=os.getenv("OPENAI_API_KEY"), temperature=0))
-    eval_set = []
-    for i, b in enumerate(sub_sequences):
-        try:
-            qa = chain.run(b)
-            eval_set.append(qa)
-            st.write("Creating Question:", i+1)
-        except Exception as e:
-            st.warning(f'Error generating question {i+1}: {e}')
-    eval_set_full = list(itertools.chain.from_iterable(eval_set))
-    return eval_set_full
+def is_response_informative(response, threshold=5):
+    """Comprueba si la respuesta tiene una cantidad mínima de palabras"""
+    words = response.split()
+    return len(words) > threshold
 
-def main():
-    st.sidebar.title("Menu")
+def are_query_words_in_pdf(query, pdf_text):
+    """Comprueba si las palabras de la consulta están en el texto del PDF"""
+    query_words = query.lower().split()
+    pdf_words = pdf_text.lower().split()
+    return all(word in pdf_words for word in query_words)
+
+def process_pdf(uploaded_file):
+    """Procesa el PDF y genera los embeddings y la base de datos vectorial"""
+    pdf_reader = PdfReader(uploaded_file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text()
     
-    embedding_option = st.sidebar.radio(
-        "Choose Embeddings", ["OpenAI Embeddings", "HuggingFace Embeddings(slower)"])
+    # Dividir el texto en trozos
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+    texts = text_splitter.split_text(text)
+    
+    # Convertir textos en documentos
+    documents = [Document(page_content=chunk) for chunk in texts]
+    
+    # Generar embeddings
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    
+    # Crear base de datos vectorial
+    vector_db = FAISS.from_documents(documents, embeddings)
+    
+    # Generar resumen del PDF
+    summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+    text_chunks = split_text_into_chunks(text, chunk_size=1024)
+    summaries = [summarizer(chunk, max_length=130, min_length=30, do_sample=False)[0]['summary_text'] for chunk in text_chunks]
+    summary = " ".join(summaries)
+    
+    return text, vector_db, summary
 
-    retriever_type = st.sidebar.selectbox(
-        "Choose Retriever", ["SIMILARITY SEARCH", "SUPPORT VECTOR MACHINES"])
+def get_response_and_references(user_query, text, vector_db):
+    """Genera la respuesta y las referencias basadas en la consulta del usuario"""
+    if not are_query_words_in_pdf(user_query, text):
+        return "No trobo cap referència rellevant en el pdf proporcionat. Si necessites alguna cosa més, fes-m'ho saber.", []
+    
+    try:
+        docs = vector_db.similarity_search(query=user_query, k=3)
+        tokenizer = AutoTokenizer.from_pretrained("t5-small")
+        model = AutoModelForSeq2SeqLM.from_pretrained("t5-small")
+        context = "\n".join([doc.page_content for doc in docs])
+        context_chunks = split_text_into_chunks(context, chunk_size=512)
 
-    if 'openai_api_key' not in st.session_state:
-        openai_api_key = st.text_input(
-            'Please enter your OpenAI API key', value="", placeholder="Enter the OpenAI API key which begins with sk-")
-        if openai_api_key:
-            st.session_state.openai_api_key = openai_api_key
-            os.environ["OPENAI_API_KEY"] = openai_api_key
-        else:
-            return
-    else:
-        os.environ["OPENAI_API_KEY"] = st.session_state.openai_api_key
+        # Generar respuesta basada en los fragmentos relevantes
+        answers = []
+        for chunk in context_chunks:
+            prompt = f"Context: {chunk}\nQuestion: {user_query}\nAnswer:"
+            inputs = tokenizer(prompt, return_tensors='pt', max_length=512, truncation=True)
+            outputs = model.generate(inputs.input_ids, max_new_tokens=50, num_return_sequences=1)
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            answers.append(response)
 
-    uploaded_files = st.file_uploader("Upload a PDF or TXT Document", type=["pdf", "txt"], accept_multiple_files=True)
+        final_answer = " ".join(answers).split('Answer:')[-1].strip()
 
-    if uploaded_files:
-        if 'last_uploaded_files' not in st.session_state or st.session_state.last_uploaded_files != uploaded_files:
-            st.session_state.last_uploaded_files = uploaded_files
-            if 'eval_set' in st.session_state:
-                del st.session_state['eval_set']
+        if not is_response_informative(final_answer):
+            final_answer = "Disculpa, no tinc la informació necessària per donar una resposta."
 
-        loaded_text = load_docs(uploaded_files)
-        st.write("Documents uploaded and processed.")
+        references = [doc.page_content for doc in docs]
+        return final_answer, references
 
-        splits = split_texts(loaded_text, chunk_size=1000, overlap=0)
+    except Exception as e:
+        return f"Error: {str(e)}", []
 
-        num_chunks = len(splits)
-        st.write(f"Number of text chunks: {num_chunks}")
+def display_conversation_history():
+    """Muestra el historial de conversación en estilo tipo WhatsApp"""
+    st.subheader("Historial de conversació")
+    for chat in st.session_state['history']:
+        st.markdown(f"<div class='user-msg'><strong>Pregunta:</strong> {chat['user']}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='bot-msg'><strong>Resposta:</strong> {chat['bot']}</div>", unsafe_allow_html=True)
+        if chat['references']:
+            st.markdown(f"<div class='bot-ref'><strong>Referències:</strong> {'; '.join(chat['references'])}</div>", unsafe_allow_html=True)
+    
+    if st.button("Neteja l'historial"):
+        st.session_state['history'].clear()
+        st.experimental_rerun()
 
-        if embedding_option == "OpenAI Embeddings":
-            embeddings = OpenAIEmbeddings(api_key=os.getenv("OPENAI_API_KEY"))
-        elif embedding_option == "HuggingFace Embeddings(slower)":
-            embeddings = HuggingFaceEmbeddings()
+# Definir columnas antes de usarlas
+col1, col2 = st.columns([1, 2])
 
-        retriever = create_retriever(embeddings, splits, retriever_type)
+with col1:
+    # Cargar y procesar el PDF
+    uploaded_file = st.file_uploader("Afegeix el teu PDF aquí", type=["pdf"])
+    if uploaded_file:
+        text, vector_db, summary = process_pdf(uploaded_file)
+        st.session_state['summary'] = summary
+        st.success("Processat correcte.")
 
-        callback_handler = StreamingStdOutCallbackHandler()
-        callback_manager = CallbackManager([callback_handler])
+        # Mostrar contenido del PDF
+        st.subheader("Contingut del PDF")
+        st.text_area("Text del PDF", value=text, height=400)
 
-        chat_openai = ChatOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"), streaming=True, callback_manager=callback_manager, verbose=True, temperature=0)
-        qa = RetrievalQA.from_chain_type(llm=chat_openai, retriever=retriever, chain_type="stuff", verbose=True)
+        # Mostrar resumen inicial como bienvenida
+        st.subheader("Benvingut a LSDatasheet!")
+        st.write(f"El document tracta sobre: {summary}")
+        st.write("Estaré encantat d’ajudar-te en qualsevol cosa que necessitis.")
 
-        if 'eval_set' not in st.session_state:
-            num_eval_questions = 10
-            st.session_state.eval_set = generate_eval(
-                loaded_text, num_eval_questions, 3000)
+with col2:
+    if uploaded_file:
+        st.markdown('<div class="separator"></div>', unsafe_allow_html=True)  # Línea separadora
+        # Realizar una consulta
+        st.subheader("XatBot")
+        user_query = st.text_input("En què et puc ajudar?")
+        if user_query:
+            final_answer, references = get_response_and_references(user_query, text, vector_db)
+            st.write("Resposta:", final_answer)
 
-        for i, qa_pair in enumerate(st.session_state.eval_set):
-            st.sidebar.markdown(
-                f"""
-                <div class="css-card">
-                <span class="card-tag">Question {i + 1}</span>
-                    <p style="font-size: 12px;">{qa_pair['question']}</p>
-                    <p style="font-size: 12px;">{qa_pair['answer']}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        st.write("Ready to answer questions.")
+            # Mostrar referencias utilizadas
+            if references:
+                st.subheader("Referències utilitzades")
+                for ref in references:
+                    st.write(ref)
 
-        user_question = st.text_input("Enter your question:")
-        if user_question:
-            answer = qa.run(user_question)
-            st.write("Answer:", answer)
+            # Guardar historial de conversación
+            st.session_state['history'].append({"user": user_query, "bot": final_answer, "references": references})
 
-if __name__ == "__main__":
-    main()
+        display_conversation_history()
